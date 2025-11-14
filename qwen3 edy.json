@@ -1,0 +1,195 @@
+{
+  "id": "596be4bc-d2e2-478a-8b8a-ef4319eaf22e",
+  "revision": 0,
+  "last_node_id": 9,
+  "last_link_id": 7,
+  "nodes": [
+    {
+      "id": 2,
+      "type": "PreviewImage",
+      "pos": [
+        7613.29248046875,
+        -851.20458984375
+      ],
+      "size": [
+        566.34130859375,
+        520.2894897460938
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 6
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.0.1"
+        }
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 8,
+      "type": "MemoryCleaner",
+      "pos": [
+        7309.99169921875,
+        -855.1024169921875
+      ],
+      "size": [
+        270,
+        178
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "shape": 7,
+          "type": "*",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MemoryCleaner",
+        "ue_properties": {
+          "widget_ue_connectable": {
+            "aggressive_trim": true,
+            "enable_privileges": true,
+            "purge_standby": true,
+            "external_helper": true,
+            "skip_trim_if_c_low": true,
+            "min_c_free_gb": true
+          },
+          "version": "7.0.1"
+        }
+      },
+      "widgets_values": [
+        true,
+        true,
+        false,
+        true,
+        false,
+        20
+      ]
+    },
+    {
+      "id": 9,
+      "type": "eddy_qwen_image_blockswap",
+      "pos": [
+        6884.06884765625,
+        -852.5430908203125
+      ],
+      "size": [
+        400,
+        1138
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "eddy_qwen_image_blockswap"
+      },
+      "widgets_values": [
+        "女人坐在海边",
+        "",
+        "qwen_image_fp8_e4m3fn.safetensors",
+        "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "qwen_image_vae.safetensors",
+        1328,
+        1328,
+        8,
+        2.5,
+        "sa_solver",
+        "beta",
+        409994233563513,
+        "randomize",
+        "fp16_fast",
+        "none",
+        1,
+        "none",
+        0,
+        "none",
+        0,
+        "none",
+        0,
+        true,
+        20,
+        "auto",
+        true,
+        true,
+        false,
+        "high",
+        false,
+        "bfloat16",
+        false,
+        false,
+        "default",
+        true
+      ]
+    }
+  ],
+  "links": [
+    [
+      6,
+      8,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      7,
+      9,
+      0,
+      8,
+      0,
+      "*"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ue_links": [],
+    "ds": {
+      "scale": 1.7088742511254225,
+      "offset": [
+        -7421.567504356645,
+        803.2469231831205
+      ]
+    },
+    "links_added_by_ue": [],
+    "frontendVersion": "1.25.9",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
