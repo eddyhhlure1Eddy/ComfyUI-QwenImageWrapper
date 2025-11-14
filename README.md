@@ -1,3 +1,6 @@
+<img width="1008" height="899" alt="image" src="https://github.com/user-attachments/assets/cf2ebbd9-77aa-4160-a009-26203b336759" />
+
+
 # ComfyUI-QwenImageWrapper
 
 Integrated Qwen-Image node for ComfyUI with built-in optimizations.
