@@ -1,4 +1,5 @@
-<img width="1008" height="899" alt="image" src="https://github.com/user-attachments/assets/cf2ebbd9-77aa-4160-a009-26203b336759" />
+<img width="1103" height="599" alt="image" src="https://github.com/user-attachments/assets/c7d583c6-dca9-43b1-9510-306211977891" />
+
 
 
 # ComfyUI-QwenImageWrapper
