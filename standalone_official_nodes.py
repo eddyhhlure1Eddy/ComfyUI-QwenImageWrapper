@@ -20,11 +20,11 @@ comfyui_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 MODE_COMFY = False
 
 try:
-    from .kv_cache_manager import UnifiedCacheManager
-    KV_CACHE_AVAILABLE = True
+    from .compile_cache_manager import UnifiedCacheManager
+    COMPILE_CACHE_AVAILABLE = True
 except Exception as e:
-    logging.warning(f"KV Cache Manager not available: {e}")
-    KV_CACHE_AVAILABLE = False
+    logging.warning(f"Compile Cache Manager not available: {e}")
+    COMPILE_CACHE_AVAILABLE = False
     UnifiedCacheManager = None
 
 class SimpleBlockSwap:
@@ -576,6 +576,12 @@ class ModelSamplingAuraFlow(ModelSamplingSD3):
 
 
 class EddyQwenImageBlockSwap(ComfyNodeABC):
+    def __init__(self):
+        self.processed_model = None
+        self.processed_clip = None
+        self.processed_vae = None
+        self.config_hash = None
+
     @classmethod
     def INPUT_TYPES(cls) -> InputTypeDict:
         unet_list = folder_paths.get_filename_list("diffusion_models")
@@ -622,7 +628,7 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
                 "use_channels_last": ("BOOLEAN", {"default": False, "tooltip": "NHWC memory layout (10-20% faster convolutions, may cause issues with some models)"}),
                 "enable_flash_attention": ("BOOLEAN", {"default": True, "tooltip": "Optimized attention kernel (2-4x faster attention, always recommended)"}),
                 "compile_mode": (["default", "reduce-overhead", "max-autotune"], {"default": "default", "tooltip": "Compile optimization: default=fast compile, reduce-overhead=better runtime, max-autotune=best runtime but VERY slow compile"}),
-                "enable_kv_cache": ("BOOLEAN", {"default": True, "tooltip": "Cache compiled model (2nd startup 15s vs 3min, always recommended if using torch.compile)"}),
+                "enable_kv_cache": ("BOOLEAN", {"default": True, "tooltip": "Track compilation metadata (torch auto-reuses compiled kernels on 2nd run, reduces startup from 3min to 15s)"}),
             }
         }
 
@@ -670,7 +676,7 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
                 "dynamic": False,
             }
 
-            if enable_kv_cache and KV_CACHE_AVAILABLE:
+            if enable_kv_cache and COMPILE_CACHE_AVAILABLE:
                 try:
                     cache_manager = UnifiedCacheManager()
 
@@ -706,7 +712,7 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
 
                 logging.info(f"Model compilation completed successfully with mode={compile_mode}")
 
-                if enable_kv_cache and KV_CACHE_AVAILABLE:
+                if enable_kv_cache and COMPILE_CACHE_AVAILABLE:
                     try:
                         cache_manager = UnifiedCacheManager()
                         cache_manager.mark_model_compiled(unet_path, compile_config)
@@ -736,104 +742,133 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
         if enable_matmul_optimization:
             self._apply_matmul_optimizations(matmul_precision, use_autocast, autocast_dtype)
 
-        # 1) load diffusion model with dynamic quantization
-        unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
-        model_options = {}
+        import hashlib
+        import json
 
-        if quantization_dtype != "default":
-            if quantization_dtype == "fp8_e4m3fn":
-                model_options["weight_dtype"] = torch.float8_e4m3fn
-            elif quantization_dtype == "fp8_e5m2":
-                model_options["weight_dtype"] = "fp8_e5m2"
-            elif quantization_dtype == "fp16":
-                model_options["weight_dtype"] = torch.float16
-            elif quantization_dtype == "fp16_fast":
-                model_options["weight_dtype"] = torch.float16
-                if hasattr(torch.backends.cuda.matmul, 'allow_fp16_reduced_precision_reduction'):
-                    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-                    logging.info("Using FP16-Fast: FP16 with reduced precision reduction enabled")
-            elif quantization_dtype == "bf16":
-                model_options["weight_dtype"] = torch.bfloat16
-            elif quantization_dtype == "bf16_fast":
-                model_options["weight_dtype"] = torch.bfloat16
-                if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
-                    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-                    logging.info("Using BF16-Fast: BF16 with reduced precision reduction enabled")
+        config_str = json.dumps({
+            "unet": unet_name,
+            "clip": clip_name,
+            "vae": vae_name,
+            "quant": quantization_dtype,
+            "loras": [(lora_1_name, lora_1_strength), (lora_2_name, lora_2_strength),
+                      (lora_3_name, lora_3_strength), (lora_4_name, lora_4_strength)],
+            "blockswap": use_blockswap,
+            "bs_blocks": blockswap_blocks,
+            "bs_size": blockswap_model_size,
+            "bs_rec": blockswap_use_recommended,
+            "compile": use_torch_compile,
+            "cmode": compile_mode,
+            "channels": use_channels_last,
+        }, sort_keys=True)
+        current_hash = hashlib.md5(config_str.encode()).hexdigest()
 
-        model = comfy_sd.load_diffusion_model(unet_path, model_options=model_options)
-
-        if use_channels_last and hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
-            try:
-                model.model.diffusion_model = model.model.diffusion_model.to(memory_format=torch.channels_last)
-                logging.info("Applied channels_last memory format for optimized convolutions")
-            except Exception as e:
-                logging.warning(f"Failed to apply channels_last format: {e}")
-
-        if enable_flash_attention and hasattr(model, 'model'):
-            try:
-                if hasattr(model.model, 'diffusion_model'):
-                    logging.info("Flash Attention will be automatically used by PyTorch SDPA")
-            except Exception as e:
-                logging.warning(f"Flash Attention check failed: {e}")
-
-        # 2) apply multiple LoRAs
-        lora_configs = [
-            (lora_1_name, lora_1_strength),
-            (lora_2_name, lora_2_strength),
-            (lora_3_name, lora_3_strength),
-            (lora_4_name, lora_4_strength),
-        ]
-
-        lora_loader = LoraLoaderModelOnly()
-        for lora_name, lora_strength in lora_configs:
-            if lora_strength != 0.0 and lora_name and lora_name != "none":
-                try:
-                    model, = lora_loader.load_lora_model_only(model, lora_name, lora_strength)
-                    logging.info(f"Applied LoRA: {lora_name} with strength {lora_strength}")
-                except Exception as e:
-                    logging.warning(f"Failed to load LoRA {lora_name}: {e}")
-
-        # 3) optional BlockSwap with configurable parameters
-        if use_blockswap:
-            try:
-                logging.info(f"Applying BlockSwap: blocks={blockswap_blocks}, model_size={blockswap_model_size}, use_recommended={blockswap_use_recommended}")
-                bs_optimizer = SimpleBlockSwap(
-                    blocks_to_swap=blockswap_blocks,
-                    model_size=blockswap_model_size
-                )
-                model = bs_optimizer.apply_blockswap(model, use_recommended=blockswap_use_recommended)
-                logging.info("BlockSwap applied successfully")
-            except Exception as e:
-                logging.error(f"BlockSwap application failed: {e}")
-                import traceback
-                logging.error(traceback.format_exc())
-                logging.warning("Continuing without BlockSwap")
+        if self.config_hash == current_hash and self.processed_model is not None:
+            logging.info("Reusing processed model from memory (LoRA+BlockSwap+Compile already applied)")
+            model = self.processed_model
+            clip = self.processed_clip
+            vae = self.processed_vae
         else:
-            logging.info("BlockSwap disabled by user")
+            if self.processed_model is not None:
+                logging.info("Config changed - reprocessing model")
 
-        # 3.5) optional torch.compile optimization with KV cache
-        model = self._compile_model_if_needed(model, unet_path, use_torch_compile, compile_mode, enable_kv_cache)
+            # 1) load diffusion model with dynamic quantization
+            unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+            model_options = {}
 
-        # 4) load CLIP
-        clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
-        clip_type = comfy_sd.CLIPType.WAN
-        clip = comfy_sd.load_clip(
-            ckpt_paths=[clip_path],
-            embedding_directory=folder_paths.get_folder_paths("embeddings"),
-            clip_type=clip_type,
-            model_options={"manual_cast_dtype": None},
-        )
+            if quantization_dtype != "default":
+                if quantization_dtype == "fp8_e4m3fn":
+                    model_options["weight_dtype"] = torch.float8_e4m3fn
+                elif quantization_dtype == "fp8_e5m2":
+                    model_options["weight_dtype"] = "fp8_e5m2"
+                elif quantization_dtype == "fp16":
+                    model_options["weight_dtype"] = torch.float16
+                elif quantization_dtype == "fp16_fast":
+                    model_options["weight_dtype"] = torch.float16
+                    if hasattr(torch.backends.cuda.matmul, 'allow_fp16_reduced_precision_reduction'):
+                        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+                        logging.info("Using FP16-Fast: FP16 with reduced precision reduction enabled")
+                elif quantization_dtype == "bf16":
+                    model_options["weight_dtype"] = torch.bfloat16
+                elif quantization_dtype == "bf16_fast":
+                    model_options["weight_dtype"] = torch.bfloat16
+                    if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
+                        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+                        logging.info("Using BF16-Fast: BF16 with reduced precision reduction enabled")
 
-        # 5) text encode
+            model = comfy_sd.load_diffusion_model(unet_path, model_options=model_options)
+
+            if use_channels_last and hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
+                try:
+                    model.model.diffusion_model = model.model.diffusion_model.to(memory_format=torch.channels_last)
+                    logging.info("Applied channels_last memory format for optimized convolutions")
+                except Exception as e:
+                    logging.warning(f"Failed to apply channels_last format: {e}")
+
+            if enable_flash_attention and hasattr(model, 'model'):
+                try:
+                    if hasattr(model.model, 'diffusion_model'):
+                        logging.info("Flash Attention will be automatically used by PyTorch SDPA")
+                except Exception as e:
+                    logging.warning(f"Flash Attention check failed: {e}")
+
+            # 2) apply multiple LoRAs
+            lora_configs = [
+                (lora_1_name, lora_1_strength),
+                (lora_2_name, lora_2_strength),
+                (lora_3_name, lora_3_strength),
+                (lora_4_name, lora_4_strength),
+            ]
+
+            lora_loader = LoraLoaderModelOnly()
+            for lora_name, lora_strength in lora_configs:
+                if lora_strength != 0.0 and lora_name and lora_name != "none":
+                    try:
+                        model, = lora_loader.load_lora_model_only(model, lora_name, lora_strength)
+                        logging.info(f"Applied LoRA: {lora_name} with strength {lora_strength}")
+                    except Exception as e:
+                        logging.warning(f"Failed to load LoRA {lora_name}: {e}")
+
+            # 3) optional BlockSwap with configurable parameters
+            if use_blockswap:
+                try:
+                    logging.info(f"Applying BlockSwap: blocks={blockswap_blocks}, model_size={blockswap_model_size}, use_recommended={blockswap_use_recommended}")
+                    bs_optimizer = SimpleBlockSwap(
+                        blocks_to_swap=blockswap_blocks,
+                        model_size=blockswap_model_size
+                    )
+                    model = bs_optimizer.apply_blockswap(model, use_recommended=blockswap_use_recommended)
+                    logging.info("BlockSwap applied successfully")
+                except Exception as e:
+                    logging.error(f"BlockSwap application failed: {e}")
+                    import traceback
+                    logging.error(traceback.format_exc())
+                    logging.warning("Continuing without BlockSwap")
+            else:
+                logging.info("BlockSwap disabled by user")
+
+            # 3.5) optional torch.compile optimization with KV cache
+            model = self._compile_model_if_needed(model, unet_path, use_torch_compile, compile_mode, enable_kv_cache)
+
+            # 4) load CLIP
+            clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
+            clip_type = comfy_sd.CLIPType.WAN
+            clip = comfy_sd.load_clip(
+                ckpt_paths=[clip_path],
+                embedding_directory=folder_paths.get_folder_paths("embeddings"),
+                clip_type=clip_type,
+                model_options={"manual_cast_dtype": None},
+            )
+
+            # 6) load VAE
+            vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+            vae_sd = comfy_utils.load_torch_file(vae_path)
+            vae = comfy_sd.VAE(sd=vae_sd)
+
+        # 5) text encode (always run, prompt changes each time)
         pos_tokens = clip.tokenize(positive)
         neg_tokens = clip.tokenize(negative)
         positive_cond = clip.encode_from_tokens_scheduled(pos_tokens)
         negative_cond = clip.encode_from_tokens_scheduled(neg_tokens)
-
-        # 6) load VAE
-        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
-        vae_sd = comfy_utils.load_torch_file(vae_path)
-        vae = comfy_sd.VAE(sd=vae_sd)
 
         # 7) latent
         device = comfy_model_management.intermediate_device()
@@ -883,6 +918,14 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
         images = vae.decode(samples["samples"])
         if len(images.shape) == 5:
             images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+
+        if self.config_hash != current_hash:
+            self.processed_model = model
+            self.processed_clip = clip
+            self.processed_vae = vae
+            self.config_hash = current_hash
+            logging.info("Saved processed model in memory - next run will skip LoRA/BlockSwap/Compile!")
+
         return (images,)
 
 
