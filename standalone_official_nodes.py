@@ -769,7 +769,44 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
             vae = self.processed_vae
         else:
             if self.processed_model is not None:
-                logging.info("Config changed - reprocessing model")
+                logging.info("Config changed - unloading old model and reprocessing")
+
+                try:
+                    if hasattr(self.processed_model, 'model') and hasattr(self.processed_model.model, 'diffusion_model'):
+                        del self.processed_model.model.diffusion_model
+                    del self.processed_model
+                    del self.processed_clip
+                    del self.processed_vae
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+
+                    import gc
+                    gc.collect()
+
+                    try:
+                        import ctypes
+                        if hasattr(ctypes, 'windll'):
+                            kernel32 = ctypes.windll.kernel32
+                            process_handle = kernel32.GetCurrentProcess()
+                            kernel32.SetProcessWorkingSetSize(process_handle, -1, -1)
+
+                            psapi = ctypes.windll.psapi
+                            psapi.EmptyWorkingSet(process_handle)
+
+                            logging.info("Forced Windows RAM cleanup via Win32 API")
+                    except Exception as e:
+                        logging.debug(f"Win32 RAM cleanup not available: {e}")
+
+                    logging.info("Old model unloaded from VRAM and RAM")
+                except Exception as e:
+                    logging.warning(f"Failed to unload old model: {e}")
+
+                self.processed_model = None
+                self.processed_clip = None
+                self.processed_vae = None
+                self.config_hash = None
 
             # 1) load diffusion model with dynamic quantization
             unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
