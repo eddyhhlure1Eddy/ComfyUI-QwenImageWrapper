@@ -22,17 +22,10 @@ class KVCacheManager:
             logging.error(f"Failed to create cache directory {self.cache_dir}: {e}")
             raise
 
-        self.compiled_models_dir = self.cache_dir / "compiled_models"
-        try:
-            self.compiled_models_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            logging.error(f"Failed to create compiled models directory {self.compiled_models_dir}: {e}")
-            raise
-
-        self.metadata_file = self.cache_dir / "cache_metadata.json"
+        self.metadata_file = self.cache_dir / "compilation_metadata.json"
         self.metadata = self._load_metadata()
 
-        logging.info(f"KV Cache Manager initialized at: {self.cache_dir}")
+        logging.info(f"Compilation tracker initialized at: {self.cache_dir}")
 
     def _load_metadata(self) -> Dict[str, Any]:
         if self.metadata_file.exists():
@@ -69,64 +62,35 @@ class KVCacheManager:
 
         return hasher.hexdigest()
 
-    def get_cached_compiled_model(self, model_path: str, config: Dict[str, Any]) -> Optional[torch.nn.Module]:
+    def check_compiled_cache(self, model_path: str, config: Dict[str, Any]) -> bool:
         cache_key = self._compute_model_hash(model_path, config)
 
-        if cache_key not in self.metadata:
-            logging.info(f"No cache found for model: {os.path.basename(model_path)}")
-            return None
+        if cache_key in self.metadata:
+            cache_info = self.metadata[cache_key]
+            logging.info(f"Compilation cache exists for model: {os.path.basename(model_path)}")
+            logging.info(f"Previously compiled on: {cache_info.get('timestamp', 'unknown')}")
+            return True
 
-        cache_info = self.metadata[cache_key]
-        cache_file = self.compiled_models_dir / f"{cache_key}.pt"
+        logging.info(f"No compilation cache found for model: {os.path.basename(model_path)}")
+        return False
 
-        if not cache_file.exists():
-            logging.warning(f"Cache file missing: {cache_file}")
-            del self.metadata[cache_key]
-            self._save_metadata()
-            return None
-
-        try:
-            logging.info(f"Loading cached compiled model: {os.path.basename(model_path)}")
-            cached_state = torch.load(cache_file, map_location='cpu')
-
-            logging.info(f"Cache hit! Model compiled on: {cache_info.get('timestamp', 'unknown')}")
-            logging.info(f"Compilation config: {cache_info.get('config', {})}")
-
-            return cached_state
-        except Exception as e:
-            logging.error(f"Failed to load cached model: {e}")
-            if cache_file.exists():
-                cache_file.unlink()
-            if cache_key in self.metadata:
-                del self.metadata[cache_key]
-                self._save_metadata()
-            return None
-
-    def cache_compiled_model(self, model_path: str, config: Dict[str, Any], compiled_model: torch.nn.Module):
+    def mark_compiled(self, model_path: str, config: Dict[str, Any]):
         cache_key = self._compute_model_hash(model_path, config)
-        cache_file = self.compiled_models_dir / f"{cache_key}.pt"
 
         try:
-            logging.info(f"Caching compiled model: {os.path.basename(model_path)}")
-
-            torch.save(compiled_model, cache_file)
-
             from datetime import datetime
             self.metadata[cache_key] = {
                 "model_path": model_path,
                 "config": config,
                 "timestamp": datetime.now().isoformat(),
-                "cache_file": str(cache_file),
                 "pytorch_version": torch.__version__,
                 "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
             }
             self._save_metadata()
 
-            logging.info(f"Model cached successfully: {cache_file.name}")
+            logging.info(f"Marked model as compiled: {os.path.basename(model_path)}")
         except Exception as e:
-            logging.error(f"Failed to cache compiled model: {e}")
-            if cache_file.exists():
-                cache_file.unlink()
+            logging.error(f"Failed to mark model as compiled: {e}")
 
     def clear_cache(self, older_than_days: Optional[int] = None):
         from datetime import datetime, timedelta
@@ -148,23 +112,15 @@ class KVCacheManager:
                 should_clear = True
 
             if should_clear:
-                cache_file = self.compiled_models_dir / f"{cache_key}.pt"
-                if cache_file.exists():
-                    cache_file.unlink()
-                    cleared_count += 1
                 del self.metadata[cache_key]
+                cleared_count += 1
 
         self._save_metadata()
-        logging.info(f"Cleared {cleared_count} cached models")
+        logging.info(f"Cleared {cleared_count} compilation metadata entries")
 
     def get_cache_stats(self) -> Dict[str, Any]:
-        total_size = 0
-        for cache_file in self.compiled_models_dir.glob("*.pt"):
-            total_size += cache_file.stat().st_size
-
         return {
-            "total_cached_models": len(self.metadata),
-            "total_size_mb": total_size / (1024 * 1024),
+            "total_compiled_models": len(self.metadata),
             "cache_directory": str(self.cache_dir),
         }
 
@@ -297,27 +253,12 @@ class UnifiedCacheManager:
         self._initialized = True
         logging.info("Unified Cache Manager initialized")
 
-    def get_or_compile_model(self, model, model_path: str, compile_config: Dict[str, Any]) -> torch.nn.Module:
-        cached = self.kv_cache_manager.get_cached_compiled_model(model_path, compile_config)
+    def check_and_mark_compilation(self, model_path: str, compile_config: Dict[str, Any]) -> bool:
+        is_cached = self.kv_cache_manager.check_compiled_cache(model_path, compile_config)
+        return is_cached
 
-        if cached is not None:
-            logging.info("Using cached compiled model - skipping compilation")
-            return cached
-
-        logging.info("No cache found - compiling model (this will take a few minutes)...")
-        logging.info("Subsequent runs will be much faster using cached compilation")
-
-        if hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
-            model.model.diffusion_model = torch.compile(
-                model.model.diffusion_model,
-                mode=compile_config.get('mode', 'default'),
-                fullgraph=compile_config.get('fullgraph', False),
-                dynamic=compile_config.get('dynamic', False),
-            )
-
-        self.kv_cache_manager.cache_compiled_model(model_path, compile_config, model.model.diffusion_model)
-
-        return model
+    def mark_model_compiled(self, model_path: str, compile_config: Dict[str, Any]):
+        self.kv_cache_manager.mark_compiled(model_path, compile_config)
 
     def clear_all_caches(self):
         logging.info("Clearing all caches...")
@@ -342,13 +283,12 @@ class UnifiedCacheManager:
         print("=" * 80)
         print()
 
-        print("KV Cache (Compiled Models):")
-        print(f"  Total cached models: {stats['kv_cache']['total_cached_models']}")
-        print(f"  Total size: {stats['kv_cache']['total_size_mb']:.2f} MB")
-        print(f"  Directory: {stats['kv_cache']['cache_directory']}")
+        print("Compilation Tracker:")
+        print(f"  Tracked compilations: {stats['kv_cache']['total_compiled_models']}")
+        print(f"  Metadata directory: {stats['kv_cache']['cache_directory']}")
         print()
 
-        print("Torch Compile Cache:")
+        print("Torch Inductor Cache:")
         print(f"  Size: {stats['compile_cache_size_mb']:.2f} MB")
         print()
 

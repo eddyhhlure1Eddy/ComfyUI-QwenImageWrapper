@@ -674,16 +674,13 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
                 try:
                     cache_manager = UnifiedCacheManager()
 
-                    logging.info("Checking KV cache for compiled model...")
-                    cached_model = cache_manager.kv_cache_manager.get_cached_compiled_model(unet_path, compile_config)
+                    logging.info("Checking compilation cache...")
+                    is_previously_compiled = cache_manager.check_and_mark_compilation(unet_path, compile_config)
 
-                    if cached_model is not None:
-                        logging.info("Using cached compiled model - skipping compilation (instant load!)")
-                        model.model.diffusion_model = cached_model
-                        model._compiled = True
-                        return model
+                    if is_previously_compiled:
+                        logging.info("Model was previously compiled - torch will reuse cached kernels automatically")
                 except Exception as e:
-                    logging.warning(f"KV cache check failed: {e}, will compile normally")
+                    logging.warning(f"Cache check failed: {e}, will compile normally")
 
             try:
                 logging.info(f"Compiling model with torch.compile (mode={compile_mode})...")
@@ -712,10 +709,10 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
                 if enable_kv_cache and KV_CACHE_AVAILABLE:
                     try:
                         cache_manager = UnifiedCacheManager()
-                        cache_manager.kv_cache_manager.cache_compiled_model(unet_path, compile_config, compiled_diffusion_model)
-                        logging.info("Compiled model cached for future use")
+                        cache_manager.mark_model_compiled(unet_path, compile_config)
+                        logging.info("Compilation metadata saved - future runs will reuse torch inductor cache automatically")
                     except Exception as e:
-                        logging.warning(f"Failed to cache compiled model: {e}")
+                        logging.warning(f"Failed to save compilation metadata: {e}")
 
             except Exception as e:
                 logging.warning(f"torch.compile failed: {e}, continuing without compilation")
