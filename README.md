@@ -1,5 +1,11 @@
 <img width="1103" height="599" alt="image" src="https://github.com/user-attachments/assets/c7d583c6-dca9-43b1-9510-306211977891" />
 
+New Feature Update - November 16, 2025
+
+Qwen Edit Mode:
+- Auto-detects edit mode when an image is connected to the input
+- Defaults to text-to-image mode when no image is connected
+- Added reference strength control in the bottom panel for fine-tuning image influence
 
 
 # ComfyUI-QwenImageWrapper
