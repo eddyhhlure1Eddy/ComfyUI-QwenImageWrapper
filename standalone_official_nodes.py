@@ -629,6 +629,12 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
                 "enable_flash_attention": ("BOOLEAN", {"default": True, "tooltip": "Optimized attention kernel (2-4x faster attention, always recommended)"}),
                 "compile_mode": (["default", "reduce-overhead", "max-autotune"], {"default": "default", "tooltip": "Compile optimization: default=fast compile, reduce-overhead=better runtime, max-autotune=best runtime but VERY slow compile"}),
                 "enable_kv_cache": ("BOOLEAN", {"default": True, "tooltip": "Track compilation metadata (torch auto-reuses compiled kernels on 2nd run, reduces startup from 3min to 15s)"}),
+            },
+            "optional": {
+                "image": ("IMAGE", {"tooltip": "Optional input image for Qwen-Image-Edit. The model will reference this image while generating"}),
+                "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Reference strength: 1.0=closely follow input image (preserve person/style), 0.7=moderate changes, 0.3=more creative freedom"}),
+                "reference_strength": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 3.0, "step": 0.1, "tooltip": "人物一致性强度: 1.0=标准, 1.5-2.0=增强保持人物特征, 2.5-3.0=极强一致性 (可能过拟合)"}),
+                "batch_prompts": ("STRING", {"forceInput": True, "tooltip": "Batch prompts from Batch Prompt node (connect batch_prompts output here for batch generation)"}),
             }
         }
 
@@ -735,9 +741,42 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
                  use_blockswap, blockswap_blocks, blockswap_model_size, blockswap_use_recommended,
                  enable_matmul_optimization=True, use_torch_compile=False, matmul_precision="high",
                  use_autocast=False, autocast_dtype="bfloat16", use_channels_last=False,
-                 enable_flash_attention=True, compile_mode="default", enable_kv_cache=True):
+                 enable_flash_attention=True, compile_mode="default", enable_kv_cache=True,
+                 image=None, denoise=1.0, reference_strength=1.0, batch_prompts=None):
         if not MODE_COMFY:
             raise RuntimeError("EddyQwenImageBlockSwap requires full Comfy core mode.")
+        
+        # Batch processing mode
+        if batch_prompts is not None:
+            prompts_list = batch_prompts if isinstance(batch_prompts, list) else [batch_prompts]
+            logging.info(f"[BatchMode] Processing {len(prompts_list)} prompts")
+            
+            all_images = []
+            for i, batch_prompt in enumerate(prompts_list, 1):
+                logging.info(f"[BatchMode] Generating image {i}/{len(prompts_list)}: {batch_prompt[:60]}...")
+                
+                # Generate single image with current prompt
+                result = self.generate(
+                    batch_prompt, negative, unet_name, clip_name, vae_name,
+                    width, height, steps, cfg, sampler_name, scheduler, seed + i - 1,
+                    quantization_dtype,
+                    lora_1_name, lora_1_strength,
+                    lora_2_name, lora_2_strength,
+                    lora_3_name, lora_3_strength,
+                    lora_4_name, lora_4_strength,
+                    use_blockswap, blockswap_blocks, blockswap_model_size, blockswap_use_recommended,
+                    enable_matmul_optimization, use_torch_compile, matmul_precision,
+                    use_autocast, autocast_dtype, use_channels_last,
+                    enable_flash_attention, compile_mode, enable_kv_cache,
+                    image, denoise, reference_strength,
+                    batch_prompts=None  # Prevent infinite recursion
+                )
+                all_images.append(result[0])
+            
+            # Concatenate all generated images
+            final_images = torch.cat(all_images, dim=0)
+            logging.info(f"[BatchMode] ✓ Generated {len(prompts_list)} images, shape: {final_images.shape}")
+            return (final_images,)
 
         if enable_matmul_optimization:
             self._apply_matmul_optimizations(matmul_precision, use_autocast, autocast_dtype)
@@ -902,22 +941,101 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
             vae = comfy_sd.VAE(sd=vae_sd)
 
         # 5) text encode (always run, prompt changes each time)
-        pos_tokens = clip.tokenize(positive)
-        neg_tokens = clip.tokenize(negative)
+        # For Qwen-Image-Edit, pass image to CLIP tokenizer for image-aware conditioning
+        if image is not None:
+            # Prepare image for CLIP (resize to ~1MP like TextEncodeQwenImageEdit does)
+            import math
+            samples = image.movedim(-1, 1)
+            total = int(1024 * 1024)
+            scale_by = math.sqrt(total / (samples.shape[3] * samples.shape[2]))
+            scaled_width = round(samples.shape[3] * scale_by)
+            scaled_height = round(samples.shape[2] * scale_by)
+            s = comfy_utils.common_upscale(samples, scaled_width, scaled_height, "area", "disabled")
+            clip_image = s.movedim(1, -1)
+            images_for_clip = [clip_image[:, :, :, :3]]
+            
+            logging.info(f"Encoding with image context: original={image.shape}, scaled for CLIP={clip_image.shape}")
+            pos_tokens = clip.tokenize(positive, images=images_for_clip)
+            neg_tokens = clip.tokenize(negative, images=images_for_clip)
+        else:
+            logging.info("Encoding text-only (no image context)")
+            pos_tokens = clip.tokenize(positive)
+            neg_tokens = clip.tokenize(negative)
+        
         positive_cond = clip.encode_from_tokens_scheduled(pos_tokens)
         negative_cond = clip.encode_from_tokens_scheduled(neg_tokens)
 
-        # 7) latent
+        # 7) latent - support Qwen-Image-Edit if image provided
         device = comfy_model_management.intermediate_device()
-        latent = torch.zeros([1, 16, height // 8, width // 8], device=device)
+        if image is not None:
+            logging.info("Encoding input image as reference for Qwen-Image-Edit")
+            
+            # Encode image to latent as reference (do NOT resize, keep original for reference)
+            ref_latent = vae.encode(image[:, :, :, :3])
+            
+            # Ensure latent is in float32 for sampler compatibility
+            if ref_latent.dtype != torch.float32:
+                logging.info(f"Converting reference latent from {ref_latent.dtype} to float32")
+                ref_latent = ref_latent.to(dtype=torch.float32)
+            
+            # Ensure latent is on correct device
+            if ref_latent.device != device:
+                ref_latent = ref_latent.to(device=device)
+            
+            # Add reference latents to conditioning for Qwen-Image-Edit
+            # Apply reference_strength by repeating reference_latents or scaling
+            import node_helpers
+            
+            if reference_strength != 1.0:
+                # Method 1: Scale the latent to increase/decrease influence
+                ref_latent_scaled = ref_latent * reference_strength
+                
+                # Method 2: Repeat latents to reinforce consistency (stronger method)
+                ref_latents_list = [ref_latent_scaled]
+                if reference_strength >= 1.5:
+                    # For strong consistency, add multiple copies
+                    repeat_count = int((reference_strength - 1.0) / 0.5) + 1
+                    repeat_count = min(repeat_count, 5)  # Cap at 5 repetitions
+                    ref_latents_list = [ref_latent_scaled] * repeat_count
+                    logging.info(f"Enhanced consistency: repeating reference latent {repeat_count} times (strength={reference_strength})")
+                
+                positive_cond = node_helpers.conditioning_set_values(positive_cond, {"reference_latents": ref_latents_list}, append=True)
+                negative_cond = node_helpers.conditioning_set_values(negative_cond, {"reference_latents": ref_latents_list}, append=True)
+            else:
+                # Standard strength (1.0)
+                positive_cond = node_helpers.conditioning_set_values(positive_cond, {"reference_latents": [ref_latent]}, append=True)
+                negative_cond = node_helpers.conditioning_set_values(negative_cond, {"reference_latents": [ref_latent]}, append=True)
+            
+            logging.info(f"Reference latent shape: {ref_latent.shape}, dtype={ref_latent.dtype}, strength={reference_strength}")
+            logging.info("Qwen-Image-Edit mode: Starting from EMPTY latent with image as reference")
+        
+        # Always create empty latent as starting point
+        # For Qwen-Image-Edit, the input image is ONLY a reference, not the starting latent
+        logging.info("Creating empty latent as starting point")
+        latent = torch.zeros([1, 16, height // 8, width // 8], device=device, dtype=torch.float32)
         latent_dict = {"samples": latent}
 
         # 8) sampling patch (AuraFlow)
         msa = ModelSamplingAuraFlow()
         model_patched, = msa.patch_aura(model, 1.73)
 
-        # 9) KSampler with optional autocast
-        if use_autocast and torch.cuda.is_available():
+        # 9) Denoise handling for Qwen-Image-Edit
+        # Note: Qwen-Image-Edit always starts from empty latent
+        # The denoise parameter controls how much the model follows the reference vs. generates freely
+        if image is not None:
+            logging.info(f"Qwen-Image-Edit: denoise={denoise} (controls reference strength)")
+            # denoise closer to 1.0 = follow reference more closely
+            # denoise closer to 0.0 = more creative freedom (but may change person)
+        
+        # 10) KSampler with controlled autocast
+        autocast_enabled = bool(use_autocast and torch.cuda.is_available())
+        if sampler_name in ["sa_solver", "sa-solver"]:
+            logging.warning("Disabling autocast for SA-Solver to keep linalg ops in float32")
+            autocast_enabled = False
+            if latent_dict["samples"].dtype != torch.float32:
+                latent_dict["samples"] = latent_dict["samples"].to(dtype=torch.float32)
+
+        if autocast_enabled:
             autocast_dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
             dtype = autocast_dtype_map.get(autocast_dtype, torch.bfloat16)
             logging.info(f"Using autocast with dtype={autocast_dtype}")
@@ -933,21 +1051,37 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
                     positive_cond,
                     negative_cond,
                     latent_dict,
-                    denoise=1.0,
+                    denoise=denoise,
                 )
         else:
-            samples_tuple = nodes.common_ksampler(
-                model_patched,
-                seed,
-                steps,
-                cfg,
-                sampler_name,
-                scheduler,
-                positive_cond,
-                negative_cond,
-                latent_dict,
-                denoise=1.0,
-            )
+            if torch.cuda.is_available():
+                # Explicitly disable autocast on CUDA to avoid implicit BF16 casts
+                with torch.cuda.amp.autocast(enabled=False):
+                    samples_tuple = nodes.common_ksampler(
+                        model_patched,
+                        seed,
+                        steps,
+                        cfg,
+                        sampler_name,
+                        scheduler,
+                        positive_cond,
+                        negative_cond,
+                        latent_dict,
+                        denoise=denoise,
+                    )
+            else:
+                samples_tuple = nodes.common_ksampler(
+                    model_patched,
+                    seed,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    positive_cond,
+                    negative_cond,
+                    latent_dict,
+                    denoise=denoise,
+                )
 
         samples = samples_tuple[0]
 

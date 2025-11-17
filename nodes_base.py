@@ -341,6 +341,8 @@ class VAEEncode:
 
     def encode(self, vae, pixels):
         t = vae.encode(pixels[:,:,:,:3])
+        if t.dtype != torch.float32:
+            t = t.to(dtype=torch.float32)
         return ({"samples":t}, )
 
 class VAEEncodeTiled:
@@ -359,6 +361,8 @@ class VAEEncodeTiled:
 
     def encode(self, vae, pixels, tile_size, overlap, temporal_size=64, temporal_overlap=8):
         t = vae.encode_tiled(pixels[:,:,:,:3], tile_x=tile_size, tile_y=tile_size, overlap=overlap, tile_t=temporal_size, overlap_t=temporal_overlap)
+        if t.dtype != torch.float32:
+            t = t.to(dtype=torch.float32)
         return ({"samples": t}, )
 
 class VAEEncodeForInpaint:
@@ -397,6 +401,8 @@ class VAEEncodeForInpaint:
             pixels[:,:,:,i] *= m
             pixels[:,:,:,i] += 0.5
         t = vae.encode(pixels)
+        if t.dtype != torch.float32:
+            t = t.to(dtype=torch.float32)
 
         return ({"samples":t, "noise_mask": (mask_erosion[:,:,:x,:y].round())}, )
 
@@ -1472,6 +1478,9 @@ class SetLatentNoiseMask:
 def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0, disable_noise=False, start_step=None, last_step=None, force_full_denoise=False):
     latent_image = latent["samples"]
     latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image)
+    # Ensure latent is float32 to avoid dtype mismatch in solvers
+    if latent_image.dtype != torch.float32:
+        latent_image = latent_image.to(dtype=torch.float32)
 
     if disable_noise:
         noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
@@ -1485,9 +1494,16 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
 
     callback = latent_preview.prepare_callback(model, steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-    samples = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
-                                  denoise=denoise, disable_noise=disable_noise, start_step=start_step, last_step=last_step,
-                                  force_full_denoise=force_full_denoise, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
+    # Disable autocast for SA-Solver to keep linalg ops in float32
+    if torch.cuda.is_available() and sampler_name in ("sa_solver", "sa-solver"):
+        with torch.cuda.amp.autocast(enabled=False):
+            samples = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
+                                          denoise=denoise, disable_noise=disable_noise, start_step=start_step, last_step=last_step,
+                                          force_full_denoise=force_full_denoise, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
+    else:
+        samples = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
+                                      denoise=denoise, disable_noise=disable_noise, start_step=start_step, last_step=last_step,
+                                      force_full_denoise=force_full_denoise, noise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
     out = latent.copy()
     out["samples"] = samples
     return (out, )
