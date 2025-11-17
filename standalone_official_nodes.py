@@ -813,6 +813,7 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
             model = self.processed_model
             clip = self.processed_clip
             vae = self.processed_vae
+            logging.info(f"DEBUG: Loaded cached clip type: {type(clip)}, clip value: {clip if isinstance(clip, str) else 'CLIP object'}")
         else:
             if self.processed_model is not None:
                 logging.info("Config changed - unloading old model and reprocessing")
@@ -1105,11 +1106,13 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
 
         # Save processed models to cache if not already cached
         if self.config_hash is None or self.config_hash != current_hash:
+            logging.info(f"DEBUG: Before saving - clip type: {type(clip)}, clip value: {clip if isinstance(clip, str) else 'CLIP object'}")
             self.processed_model = model
             self.processed_clip = clip
             self.processed_vae = vae
             self.config_hash = current_hash
             logging.info("Saved processed model in memory - next run will skip LoRA/BlockSwap/Compile!")
+            logging.info(f"DEBUG: After saving - self.processed_clip type: {type(self.processed_clip)}")
 
         # Pin models to GPU VRAM if enabled
         if keep_model_in_vram and not self.pin_enabled:
@@ -1140,9 +1143,10 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
                     logging.info(f"Pinned {pinned_count}/{total_params} UNet parameters to GPU")
 
                 # Pin CLIP model
-                if hasattr(clip, 'cond_stage_model'):
+                logging.info(f"DEBUG: Attempting to pin CLIP. Type: {type(clip)}, is str: {isinstance(clip, str)}")
+                if clip is not None and not isinstance(clip, str) and hasattr(clip, 'cond_stage_model'):
                     clip_model = clip.cond_stage_model
-                    if hasattr(clip_model, 'clip'):
+                    if hasattr(clip_model, 'clip') and not isinstance(clip_model.clip, str):
                         clip_params = list(clip_model.clip.parameters())
                         half_clip = len(clip_params) // 2
 
@@ -1155,6 +1159,10 @@ class EddyQwenImageBlockSwap(ComfyNodeABC):
                                 pinned_clip += 1
 
                         logging.info(f"Pinned {pinned_clip}/{len(clip_params)} CLIP parameters to GPU")
+                    else:
+                        logging.warning(f"CLIP model structure unexpected. clip_model.clip type: {type(getattr(clip_model, 'clip', None))}")
+                else:
+                    logging.warning(f"Skipping CLIP pinning. clip is None: {clip is None}, is str: {isinstance(clip, str) if clip is not None else 'N/A'}, has cond_stage_model: {hasattr(clip, 'cond_stage_model') if clip is not None else 'N/A'}")
 
                 # Pin VAE model
                 if hasattr(vae, 'first_stage_model'):
